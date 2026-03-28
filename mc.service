@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram MC Bot
+After=network.target
+
+[Service]
+Type=simple
+User=mc
+WorkingDirectory=/home/mc/mc
+Environment="PATH=/home/mc/mc/venv/bin:/usr/bin"
+EnvironmentFile=/home/mc/mc/.env
+ExecStart=/home/mc/mc/venv/bin/python3 /home/mc/mc/mc.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
