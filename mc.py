@@ -34,7 +34,7 @@ from aiogram.types import (
 )
 from aiogram.utils import executor
 from aiogram.utils.exceptions import (
-    BadRequest, Forbidden, MessageToDeleteNotFound, BotBlocked, ChatNotFound
+    BadRequest, MessageToDeleteNotFound, BotBlocked, ChatNotFound
 )
 
 # ══════════════════════════════════════════════════════════════
