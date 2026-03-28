@@ -1,21 +1,11 @@
 """
-mc.py — Бот защиты сети чатов (aiogram 2.x) — УЛУЧШЕННАЯ ВЕРСИЯ
-
-Новое:
-  - Пакетное добавление запрещённых слов через Enter (/add_words + многострочный список)
-  - /makeadmin — выдача прав администратора через reply или @username
-  - Капча при входе: бот пишет в ЛС новому участнику, при провале — кик
-  - Inline-кнопки в /settings, /help, /stats
-  - Улучшенный /help с разделами
-  - /rmadmin — снятие прав суперадмина бота
-  - /bot_admins — список суперадминов бота
+mc.py — Бот защиты сети чатов (aiogram 2.x)
 
 Запуск:
     BOT_TOKEN=<токен> python mc.py
 """
 
 import logging
-import aiogram
 import sqlite3
 import time
 import asyncio
@@ -34,24 +24,27 @@ from aiogram.types import (
 )
 from aiogram.utils import executor
 from aiogram.utils.exceptions import (
-    BadRequest, MessageToDeleteNotFound, BotBlocked, ChatNotFound
+    BadRequest, MessageToDeleteNotFound,
+    BotBlocked, ChatNotFound, Unauthorized
 )
+try:
+    from aiogram.utils.exceptions import Forbidden
+except ImportError:
+    Forbidden = (BotBlocked, Unauthorized)
 
 # ══════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
 # ══════════════════════════════════════════════════════════════
 TOKEN      = os.getenv("BOT_TOKEN", "6376776916:AAGnNP_GoorQS7wZkLhg0snutRPBJttmz70")
 OWNER_ID   = 382254550
-ADMIN_IDS  = {382254550}          # суперадмины бота (runtime-изменяемо)
-CHANNEL_ID = "-1001672973157"     # канал для проверки подписки
+ADMIN_IDS  = {382254550}
+CHANNEL_ID = "-1001672973157"
 DB_PATH    = "forbidden_words.db"
 
-MAX_WARNINGS  = 3
-MUTE_SECONDS  = 3600
-FLOOD_LIMIT   = 5
-FLOOD_WINDOW  = 10
-
-# Капча: время на прохождение (сек)
+MAX_WARNINGS    = 3
+MUTE_SECONDS    = 3600
+FLOOD_LIMIT     = 5
+FLOOD_WINDOW    = 10
 CAPTCHA_TIMEOUT = 120
 
 # ══════════════════════════════════════════════════════════════
@@ -91,6 +84,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS chat_settings (
             chat_id      INTEGER PRIMARY KEY,
+            chat_title   TEXT    DEFAULT '',
             sub_check    INTEGER DEFAULT 0,
             anti_flood   INTEGER DEFAULT 1,
             anti_forward INTEGER DEFAULT 0,
@@ -108,17 +102,14 @@ def init_db():
             ts       TEXT DEFAULT (datetime('now'))
         );
 
-        -- Хранение капч ожидающих пользователей
         CREATE TABLE IF NOT EXISTS captcha_pending (
             user_id    INTEGER NOT NULL,
             chat_id    INTEGER NOT NULL,
             code       TEXT    NOT NULL,
             created_at INTEGER NOT NULL,
-            dm_msg_id  INTEGER,
             PRIMARY KEY (user_id, chat_id)
         );
 
-        -- Суперадмины бота (персистентно)
         CREATE TABLE IF NOT EXISTS bot_admins (
             user_id  INTEGER PRIMARY KEY,
             added_by INTEGER,
@@ -126,10 +117,8 @@ def init_db():
         );
     """)
     conn.commit()
-    # Загрузить сохранённых суперадминов в runtime-set
     for row in cursor.execute("SELECT user_id FROM bot_admins").fetchall():
         ADMIN_IDS.add(row[0])
-    # Убедиться что владелец всегда в БД
     cursor.execute(
         "INSERT OR IGNORE INTO bot_admins(user_id, added_by) VALUES(?,?)",
         (OWNER_ID, OWNER_ID)
@@ -192,7 +181,7 @@ def get_setting(chat_id, key):
     if row:
         return row[0]
     defaults = dict(sub_check=0, anti_flood=1, anti_forward=0,
-                    anti_links=1, captcha=0, max_warnings=3)
+                    anti_links=1, captcha=0, max_warnings=3, chat_title='')
     return defaults.get(key, 0)
 
 
@@ -204,6 +193,25 @@ def set_setting(chat_id, key, value):
         f"UPDATE chat_settings SET {key}=? WHERE chat_id=?", (value, chat_id)
     )
     conn.commit()
+
+
+def register_chat(chat_id, title):
+    """Регистрируем/обновляем чат в БД."""
+    cursor.execute(
+        "INSERT OR IGNORE INTO chat_settings(chat_id, chat_title) VALUES(?,?)",
+        (chat_id, title)
+    )
+    cursor.execute(
+        "UPDATE chat_settings SET chat_title=? WHERE chat_id=?",
+        (title, chat_id)
+    )
+    conn.commit()
+
+
+def get_all_chats():
+    return cursor.execute(
+        "SELECT chat_id, chat_title FROM chat_settings ORDER BY chat_title"
+    ).fetchall()
 
 
 def log_violation(user_id, chat_id, vtype, text=''):
@@ -270,8 +278,7 @@ async def do_mute(chat_id, user_id, seconds: int) -> bool:
             until_date=until
         )
         cursor.execute(
-            "INSERT OR REPLACE INTO muted_users(user_id,chat_id,muted_until)"
-            " VALUES(?,?,?)",
+            "INSERT OR REPLACE INTO muted_users(user_id,chat_id,muted_until) VALUES(?,?,?)",
             (user_id, chat_id, until.isoformat())
         )
         conn.commit()
@@ -283,10 +290,6 @@ async def do_mute(chat_id, user_id, seconds: int) -> bool:
 def mention(user: types.User) -> str:
     name = user.full_name or user.username or str(user.id)
     return f'<a href="tg://user?id={user.id}">{name}</a>'
-
-
-def mention_by_id(user_id: int, name: str) -> str:
-    return f'<a href="tg://user?id={user_id}">{name}</a>'
 
 
 async def get_target(message: types.Message):
@@ -307,32 +310,64 @@ async def get_target(message: types.Message):
 #  КЛАВИАТУРЫ
 # ══════════════════════════════════════════════════════════════
 
-def settings_keyboard(chat_id):
-    af  = '✅' if get_setting(chat_id, 'anti_flood')   else '❌'
-    al  = '✅' if get_setting(chat_id, 'anti_links')   else '❌'
-    afw = '✅' if get_setting(chat_id, 'anti_forward') else '❌'
-    sc  = '✅' if get_setting(chat_id, 'sub_check')    else '❌'
-    cap = '✅' if get_setting(chat_id, 'captcha')      else '❌'
+def e(val) -> str:
+    return '✅' if val else '❌'
+
+
+def settings_text(chat_id, title=None) -> str:
+    af  = e(get_setting(chat_id, 'anti_flood'))
+    al  = e(get_setting(chat_id, 'anti_links'))
+    afw = e(get_setting(chat_id, 'anti_forward'))
+    sc  = e(get_setting(chat_id, 'sub_check'))
+    cap = e(get_setting(chat_id, 'captcha'))
+    mw  = get_setting(chat_id, 'max_warnings')
+    header = "<b>⚙️ Настройки</b>"
+    if title:
+        header += f": {title}"
+    return (
+        f"{header}\n\n"
+        f"{af} Антифлуд\n"
+        f"{al} Блок ссылок\n"
+        f"{afw} Блок пересылок\n"
+        f"{sc} Проверка подписки\n"
+        f"{cap} Капча при входе\n"
+        f"⚠️ Макс. предупреждений: <b>{mw}</b>\n\n"
+        f"Нажмите кнопку для переключения:"
+    )
+
+
+def settings_keyboard(chat_id, back_to_list=False):
+    af  = e(get_setting(chat_id, 'anti_flood'))
+    al  = e(get_setting(chat_id, 'anti_links'))
+    afw = e(get_setting(chat_id, 'anti_forward'))
+    sc  = e(get_setting(chat_id, 'sub_check'))
+    cap = e(get_setting(chat_id, 'captcha'))
     mw  = get_setting(chat_id, 'max_warnings')
 
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton(f"{af} Антифлуд",       callback_data=f"toggle:anti_flood:{chat_id}"),
-        InlineKeyboardButton(f"{al} Блок ссылок",    callback_data=f"toggle:anti_links:{chat_id}"),
-        InlineKeyboardButton(f"{afw} Блок пересылок",callback_data=f"toggle:anti_forward:{chat_id}"),
-        InlineKeyboardButton(f"{sc} Проверка подп.", callback_data=f"toggle:sub_check:{chat_id}"),
-        InlineKeyboardButton(f"{cap} Капча",         callback_data=f"toggle:captcha:{chat_id}"),
-        InlineKeyboardButton(f"⚠️ Макс. варн: {mw}", callback_data=f"warns_menu:{chat_id}"),
+        InlineKeyboardButton(f"{af} Антифлуд",        callback_data=f"toggle:anti_flood:{chat_id}"),
+        InlineKeyboardButton(f"{al} Блок ссылок",     callback_data=f"toggle:anti_links:{chat_id}"),
+        InlineKeyboardButton(f"{afw} Блок пересылок", callback_data=f"toggle:anti_forward:{chat_id}"),
+        InlineKeyboardButton(f"{sc} Проверка подп.",  callback_data=f"toggle:sub_check:{chat_id}"),
+        InlineKeyboardButton(f"{cap} Капча",          callback_data=f"toggle:captcha:{chat_id}"),
+        InlineKeyboardButton(f"⚠️ Макс. варн: {mw}",  callback_data=f"warns_menu:{chat_id}"),
     )
-    kb.add(InlineKeyboardButton("🔄 Обновить", callback_data=f"settings_refresh:{chat_id}"))
+    row = [InlineKeyboardButton("🔄 Обновить", callback_data=f"settings_refresh:{chat_id}")]
+    if back_to_list:
+        row.append(InlineKeyboardButton("← Группы", callback_data="pm:groups"))
+    kb.add(*row)
     return kb
 
 
-def warns_keyboard(chat_id):
+def warns_keyboard(chat_id, back_to_list=False):
     kb = InlineKeyboardMarkup(row_width=3)
     for n in [1, 2, 3, 5, 7, 10]:
         kb.insert(InlineKeyboardButton(str(n), callback_data=f"set_warns:{n}:{chat_id}"))
-    kb.add(InlineKeyboardButton("← Назад", callback_data=f"settings_refresh:{chat_id}"))
+    row = [InlineKeyboardButton("← Назад", callback_data=f"settings_refresh:{chat_id}")]
+    if back_to_list:
+        row.append(InlineKeyboardButton("🏠 Группы", callback_data="pm:groups"))
+    kb.add(*row)
     return kb
 
 
@@ -341,22 +376,44 @@ def help_keyboard(is_adm: bool):
     kb.add(InlineKeyboardButton("📖 Общие", callback_data="help:general"))
     if is_adm:
         kb.add(
-            InlineKeyboardButton("🛡️ Модерация",     callback_data="help:mod"),
-            InlineKeyboardButton("🚫 Слова",          callback_data="help:words"),
-            InlineKeyboardButton("⚙️ Настройки",      callback_data="help:settings"),
-            InlineKeyboardButton("👑 Суперадмины",    callback_data="help:admins"),
+            InlineKeyboardButton("🛡️ Модерация",  callback_data="help:mod"),
+            InlineKeyboardButton("🚫 Слова",       callback_data="help:words"),
+            InlineKeyboardButton("⚙️ Настройки",   callback_data="help:settings"),
+            InlineKeyboardButton("👑 Суперадмины", callback_data="help:admins"),
         )
     return kb
 
 
+def groups_list_keyboard(chats: list):
+    kb = InlineKeyboardMarkup(row_width=1)
+    for chat_id, title in chats:
+        label = title or str(chat_id)
+        kb.add(InlineKeyboardButton(f"💬 {label}", callback_data=f"pm:chat:{chat_id}"))
+    kb.add(InlineKeyboardButton("🔄 Обновить список", callback_data="pm:groups"))
+    return kb
+
+
+def chat_menu_keyboard(chat_id):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("⚙️ Настройки",     callback_data=f"pm:settings:{chat_id}"),
+        InlineKeyboardButton("📊 Статистика",     callback_data=f"pm:stats:{chat_id}"),
+        InlineKeyboardButton("🚫 Слова сети",    callback_data=f"pm:words:network"),
+        InlineKeyboardButton("🚫 Слова чата",    callback_data=f"pm:words:{chat_id}"),
+    )
+    kb.add(InlineKeyboardButton("← Все группы", callback_data="pm:groups"))
+    return kb
+
+
 # ══════════════════════════════════════════════════════════════
-#  КОМАНДЫ — ОБЩИЕ
+#  HELP TEXTS
 # ══════════════════════════════════════════════════════════════
 
 HELP_SECTIONS = {
     "general": (
         "📖 <b>Общие команды</b>\n\n"
         "/start — приветствие\n"
+        "/panel — панель управления группами (ЛС)\n"
         "/status — ваш статус и предупреждения\n"
         "/view_words — список запрещённых слов\n"
         "/help — эта справка"
@@ -375,7 +432,7 @@ HELP_SECTIONS = {
     ),
     "words": (
         "🚫 <b>Запрещённые слова</b>\n\n"
-        "/add_word &lt;слово&gt; — добавить в сеть (90 чатов)\n"
+        "/add_word &lt;слово&gt; — добавить в сеть (все чаты)\n"
         "/add_words — добавить пачкой (каждое слово с новой строки)\n"
         "/del_word &lt;слово&gt; — удалить из сети\n"
         "/add_word_here &lt;слово&gt; — только в этот чат\n"
@@ -387,12 +444,14 @@ HELP_SECTIONS = {
     ),
     "settings": (
         "⚙️ <b>Настройки чата</b>\n\n"
-        "/settings — панель настроек с кнопками\n"
-        "/anti_links on|off — блокировка ссылок\n"
-        "/anti_flood on|off — защита от флуда\n"
-        "/anti_forward on|off — блокировка пересылок\n"
-        "/captcha on|off — капча при входе\n"
-        "/on_sub | /off_sub — проверка подписки на канал"
+        "/settings — панель настроек с кнопками\n\n"
+        "Команды (показывают текущее состояние):\n"
+        "/anti_links on|off — 🔗 блокировка ссылок\n"
+        "/anti_flood on|off — 💧 защита от флуда\n"
+        "/anti_forward on|off — 📨 блокировка пересылок\n"
+        "/captcha on|off — 🔐 капча при входе\n"
+        "/on_sub | /off_sub — 📢 проверка подписки\n\n"
+        "<i>✅ — включено  ❌ — выключено</i>"
     ),
     "admins": (
         "👑 <b>Управление суперадминами</b>\n\n"
@@ -404,44 +463,64 @@ HELP_SECTIONS = {
 }
 
 
+# ══════════════════════════════════════════════════════════════
+#  КОМАНДЫ — СТАРТ И ПОМОЩЬ
+# ══════════════════════════════════════════════════════════════
+
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
-    uid = message.from_user.id
+    uid   = message.from_user.id
+    is_pm = message.chat.type == types.ChatType.PRIVATE
+
     if uid == OWNER_ID:
         role = "👑 Владелец"
     elif uid in ADMIN_IDS:
         role = "🌟 Суперадмин бота"
-    elif await is_admin(message.chat.id, uid):
+    elif not is_pm and await is_admin(message.chat.id, uid):
         role = "🛡️ Администратор чата"
     else:
         role = "👤 Пользователь"
 
-    kb = InlineKeyboardMarkup()
+    kb = InlineKeyboardMarkup(row_width=2)
     kb.add(InlineKeyboardButton("📖 Помощь", callback_data="help:general"))
+    if is_pm and uid in ADMIN_IDS:
+        kb.add(InlineKeyboardButton("💬 Управление группами", callback_data="pm:groups"))
 
-    await message.reply(
-        f"Привет! Я <b>бот-защитник</b> этой сети чатов.\n"
+    text = (
+        f"Привет! Я <b>бот-защитник</b> сети чатов.\n"
         f"Ваша роль: <b>{role}</b>\n\n"
-        f"Используйте /help для справки по командам.",
-        reply_markup=kb
     )
+    if is_pm and uid in ADMIN_IDS:
+        text += "Управляйте всеми группами прямо здесь 👇"
+    else:
+        text += "Используйте /help для справки."
+
+    await message.reply(text, reply_markup=kb)
 
 
 @dp.message_handler(commands=['help'])
 async def cmd_help(message: types.Message):
-    is_adm = await is_admin(message.chat.id, message.from_user.id)
-    await message.reply(
-        "Выберите раздел помощи 👇",
-        reply_markup=help_keyboard(is_adm)
-    )
+    uid    = message.from_user.id
+    is_pm  = message.chat.type == types.ChatType.PRIVATE
+    is_adm = (uid in ADMIN_IDS or
+              (not is_pm and await is_admin(message.chat.id, uid)))
+    kb = help_keyboard(is_adm)
+    if is_pm and uid in ADMIN_IDS:
+        kb.add(InlineKeyboardButton("💬 Управление группами", callback_data="pm:groups"))
+    await message.reply("Выберите раздел помощи 👇", reply_markup=kb)
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("help:"))
 async def cb_help(call: types.CallbackQuery):
     section = call.data.split(":")[1]
-    text = HELP_SECTIONS.get(section, "Раздел не найден.")
-    is_adm = await is_admin(call.message.chat.id, call.from_user.id)
-    await call.message.edit_text(text, reply_markup=help_keyboard(is_adm))
+    text    = HELP_SECTIONS.get(section, "Раздел не найден.")
+    uid     = call.from_user.id
+    is_pm   = call.message.chat.type == types.ChatType.PRIVATE
+    is_adm  = (uid in ADMIN_IDS or await is_admin(call.message.chat.id, uid))
+    kb = help_keyboard(is_adm)
+    if is_pm and uid in ADMIN_IDS:
+        kb.add(InlineKeyboardButton("💬 Управление группами", callback_data="pm:groups"))
+    await call.message.edit_text(text, reply_markup=kb)
     await call.answer()
 
 
@@ -457,8 +536,8 @@ async def cmd_status(message: types.Message):
     else:
         role = "👤 Пользователь"
 
-    warns = get_warnings(uid, message.chat.id)
-    max_w = get_setting(message.chat.id, 'max_warnings')
+    warns     = get_warnings(uid, message.chat.id)
+    max_w     = get_setting(message.chat.id, 'max_warnings')
     warns_bar = "🟥" * warns + "⬜" * (max_w - warns)
 
     await message.reply(
@@ -469,93 +548,375 @@ async def cmd_status(message: types.Message):
 
 
 # ══════════════════════════════════════════════════════════════
+#  ПАНЕЛЬ УПРАВЛЕНИЯ ГРУППАМИ В ЛС
+# ══════════════════════════════════════════════════════════════
+
+@dp.message_handler(commands=['panel'], chat_type=types.ChatType.PRIVATE)
+async def cmd_panel(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return await message.reply("❌ Нет прав.")
+    chats = get_all_chats()
+    if not chats:
+        return await message.reply(
+            "Бот пока не зарегистрировал ни одной группы.\n"
+            "Напишите что-нибудь в группе где есть бот — она появится здесь."
+        )
+    await message.reply(
+        f"<b>💬 Управление группами</b>\n"
+        f"Всего групп: <b>{len(chats)}</b>\n\n"
+        f"Выберите группу:",
+        reply_markup=groups_list_keyboard(chats)
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "pm:groups")
+async def cb_pm_groups(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return await call.answer("❌ Нет прав.", show_alert=True)
+    chats = get_all_chats()
+    if not chats:
+        await call.message.edit_text(
+            "Групп пока нет. Добавьте бота в группу и напишите там что-нибудь.",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("🔄 Обновить", callback_data="pm:groups")
+            )
+        )
+        return await call.answer()
+    await call.message.edit_text(
+        f"<b>💬 Управление группами</b>\n"
+        f"Всего групп: <b>{len(chats)}</b>\n\n"
+        f"Выберите группу:",
+        reply_markup=groups_list_keyboard(chats)
+    )
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("pm:chat:"))
+async def cb_pm_chat(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return await call.answer("❌ Нет прав.", show_alert=True)
+    chat_id = int(call.data.split(":")[2])
+    title   = get_setting(chat_id, 'chat_title') or str(chat_id)
+    await call.message.edit_text(
+        f"<b>💬 {title}</b>\n\n"
+        f"Выберите действие:",
+        reply_markup=chat_menu_keyboard(chat_id)
+    )
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("pm:settings:"))
+async def cb_pm_settings(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return await call.answer("❌ Нет прав.", show_alert=True)
+    chat_id = int(call.data.split(":")[2])
+    title   = get_setting(chat_id, 'chat_title') or str(chat_id)
+    await call.message.edit_text(
+        settings_text(chat_id, title),
+        reply_markup=settings_keyboard(chat_id, back_to_list=True)
+    )
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("pm:stats:"))
+async def cb_pm_stats(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return await call.answer("❌ Нет прав.", show_alert=True)
+    chat_id = int(call.data.split(":")[2])
+    title   = get_setting(chat_id, 'chat_title') or str(chat_id)
+
+    rows = cursor.execute(
+        "SELECT vtype, COUNT(*) FROM violation_log WHERE chat_id=? GROUP BY vtype",
+        (chat_id,)
+    ).fetchall()
+    net_words  = cursor.execute(
+        "SELECT COUNT(*) FROM forbidden_words WHERE scope='network'"
+    ).fetchone()[0]
+    chat_words = cursor.execute(
+        "SELECT COUNT(*) FROM forbidden_words WHERE scope=?", (str(chat_id),)
+    ).fetchone()[0]
+
+    emoji_map = {'flood': '💧', 'forward': '📨', 'link': '🔗',
+                 'forbidden_word': '🤬', 'warn': '⚠️', 'mute': '🔇',
+                 'kick': '👢', 'ban': '🔨'}
+    total = sum(c for _, c in rows)
+    lines = [
+        f"<b>📊 Статистика: {title}</b>\n",
+        f"🚫 Слов в сети: <b>{net_words}</b>",
+        f"📌 Слов в этом чате: <b>{chat_words}</b>",
+        f"⚡ Всего нарушений: <b>{total}</b>",
+    ]
+    if rows:
+        lines.append("")
+        for vtype, cnt in sorted(rows, key=lambda x: -x[1]):
+            em = emoji_map.get(vtype, '•')
+            lines.append(f"{em} {vtype}: <b>{cnt}</b>")
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("← Назад", callback_data=f"pm:chat:{chat_id}"))
+    await call.message.edit_text('\n'.join(lines), reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("pm:words:"))
+async def cb_pm_words(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return await call.answer("❌ Нет прав.", show_alert=True)
+    scope = call.data.split(":")[2]
+
+    if scope == 'network':
+        words   = [r[0] for r in cursor.execute(
+            "SELECT word FROM forbidden_words WHERE scope='network' ORDER BY word"
+        ).fetchall()]
+        label   = "всей сети"
+        back_cb = "pm:groups"
+    else:
+        chat_id = int(scope)
+        words   = [r[0] for r in cursor.execute(
+            "SELECT word FROM forbidden_words WHERE scope=? ORDER BY word", (scope,)
+        ).fetchall()]
+        label   = get_setting(chat_id, 'chat_title') or scope
+        back_cb = f"pm:chat:{chat_id}"
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("← Назад", callback_data=back_cb))
+
+    if not words:
+        text = f"<b>🚫 Слова ({label})</b>\n\nСписок пуст."
+    else:
+        chunks = [words[i:i+30] for i in range(0, len(words), 30)]
+        text = (
+            f"<b>🚫 Слова ({label})</b> — {len(words)} шт.\n\n"
+            + "\n".join(", ".join(f"<code>{w}</code>" for w in chunk) for chunk in chunks)
+        )
+
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+# ══════════════════════════════════════════════════════════════
+#  CALLBACKS — НАСТРОЙКИ (группа + ЛС)
+# ══════════════════════════════════════════════════════════════
+
+SETTING_LABELS = {
+    'anti_flood':   'Антифлуд',
+    'anti_links':   'Блок ссылок',
+    'anti_forward': 'Блок пересылок',
+    'sub_check':    'Проверка подписки',
+    'captcha':      'Капча',
+}
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("toggle:"))
+async def cb_toggle(call: types.CallbackQuery):
+    _, key, chat_id_str = call.data.split(":")
+    chat_id = int(chat_id_str)
+
+    if not await is_admin(chat_id, call.from_user.id):
+        return await call.answer("❌ Нет прав.", show_alert=True)
+
+    current = get_setting(chat_id, key)
+    new_val = 0 if current else 1
+    set_setting(chat_id, key, new_val)
+
+    label = SETTING_LABELS.get(key, key)
+    state = "включён ✅" if new_val else "выключен ❌"
+    await call.answer(f"{label} {state}")
+
+    is_pm = call.message.chat.type == types.ChatType.PRIVATE
+    title = get_setting(chat_id, 'chat_title') if is_pm else None
+
+    await call.message.edit_text(
+        settings_text(chat_id, title),
+        reply_markup=settings_keyboard(chat_id, back_to_list=is_pm)
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("settings_refresh:"))
+async def cb_settings_refresh(call: types.CallbackQuery):
+    chat_id = int(call.data.split(":")[1])
+    if not await is_admin(chat_id, call.from_user.id):
+        return await call.answer("❌ Нет прав.", show_alert=True)
+    is_pm = call.message.chat.type == types.ChatType.PRIVATE
+    title = get_setting(chat_id, 'chat_title') if is_pm else None
+    await call.message.edit_text(
+        settings_text(chat_id, title),
+        reply_markup=settings_keyboard(chat_id, back_to_list=is_pm)
+    )
+    await call.answer("Обновлено")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("warns_menu:"))
+async def cb_warns_menu(call: types.CallbackQuery):
+    chat_id = int(call.data.split(":")[1])
+    if not await is_admin(chat_id, call.from_user.id):
+        return await call.answer("❌ Нет прав.", show_alert=True)
+    is_pm = call.message.chat.type == types.ChatType.PRIVATE
+    await call.message.edit_text(
+        "<b>⚠️ Выберите максимальное количество предупреждений:</b>",
+        reply_markup=warns_keyboard(chat_id, back_to_list=is_pm)
+    )
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("set_warns:"))
+async def cb_set_warns(call: types.CallbackQuery):
+    _, n_str, chat_id_str = call.data.split(":")
+    chat_id = int(chat_id_str)
+    n = int(n_str)
+    if not await is_admin(chat_id, call.from_user.id):
+        return await call.answer("❌ Нет прав.", show_alert=True)
+    set_setting(chat_id, 'max_warnings', n)
+    await call.answer(f"Лимит установлен: {n}")
+    is_pm = call.message.chat.type == types.ChatType.PRIVATE
+    title = get_setting(chat_id, 'chat_title') if is_pm else None
+    await call.message.edit_text(
+        settings_text(chat_id, title),
+        reply_markup=settings_keyboard(chat_id, back_to_list=is_pm)
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+#  КОМАНДЫ — НАСТРОЙКИ ЧАТА (в группе с отображением состояния)
+# ══════════════════════════════════════════════════════════════
+
+@dp.message_handler(commands=['settings'])
+async def cmd_settings(message: types.Message):
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return
+    cid   = message.chat.id
+    is_pm = message.chat.type == types.ChatType.PRIVATE
+    await message.reply(
+        settings_text(cid),
+        reply_markup=settings_keyboard(cid, back_to_list=is_pm)
+    )
+
+
+def _make_toggle_cmd(command_key, label):
+    async def handler(message: types.Message):
+        if not await is_admin(message.chat.id, message.from_user.id):
+            return
+        cid = message.chat.id
+        arg = message.get_args().strip().lower()
+        if arg in ('on', '1', 'вкл'):
+            val = 1
+        elif arg in ('off', '0', 'выкл'):
+            val = 0
+        else:
+            cur   = get_setting(cid, command_key)
+            state = "✅ включена" if cur else "❌ выключена"
+            return await message.reply(
+                f"{label}: <b>{state}</b>\n"
+                f"Использование: /{command_key} on|off"
+            )
+        set_setting(cid, command_key, val)
+        state = "✅ включена" if val else "❌ выключена"
+        await message.reply(f"{label}: <b>{state}</b>")
+    handler.__name__ = f"toggle_{command_key}"
+    return handler
+
+
+dp.message_handler(commands=['anti_links'])(_make_toggle_cmd('anti_links',   '🔗 Блокировка ссылок'))
+dp.message_handler(commands=['anti_flood'])(_make_toggle_cmd('anti_flood',   '💧 Антифлуд'))
+dp.message_handler(commands=['anti_forward'])(_make_toggle_cmd('anti_forward','📨 Блокировка пересылок'))
+dp.message_handler(commands=['captcha'])(_make_toggle_cmd('captcha',         '🔐 Капча при входе'))
+
+
+@dp.message_handler(commands=['on_sub'])
+async def cmd_on_sub(message: types.Message):
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return
+    set_setting(message.chat.id, 'sub_check', 1)
+    await message.reply("📢 Проверка подписки: ✅ включена")
+
+
+@dp.message_handler(commands=['off_sub'])
+async def cmd_off_sub(message: types.Message):
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return
+    set_setting(message.chat.id, 'sub_check', 0)
+    await message.reply("📢 Проверка подписки: ❌ выключена")
+
+
+# ══════════════════════════════════════════════════════════════
 #  СУПЕРАДМИНЫ БОТА
 # ══════════════════════════════════════════════════════════════
 
 @dp.message_handler(commands=['makeadmin'])
 async def cmd_makeadmin(message: types.Message):
-    """Выдать права суперадмина бота — только для владельца."""
     if message.from_user.id != OWNER_ID:
         return await message.reply("❌ Только владелец бота может выдавать права суперадмина.")
-
     target = await get_target(message)
     if not target:
         return await message.reply(
-            "Ответьте на сообщение пользователя или укажите @username / ID.\n"
+            "Ответьте на сообщение или укажите @username / ID.\n"
             "Пример: /makeadmin @username"
         )
     if target.id == OWNER_ID:
         return await message.reply("Владелец уже имеет все права.")
     if target.is_bot:
         return await message.reply("Нельзя выдать права боту.")
-
     ADMIN_IDS.add(target.id)
     cursor.execute(
         "INSERT OR IGNORE INTO bot_admins(user_id, added_by) VALUES(?,?)",
         (target.id, message.from_user.id)
     )
     conn.commit()
-
     await message.reply(
         f"✅ {mention(target)} назначен <b>суперадмином бота</b>.\n"
-        f"Он получил доступ ко всем командам управления во всех чатах сети."
+        f"Ему доступны все команды управления во всех чатах сети."
     )
-
-    # Уведомить нового суперадмина в ЛС
     try:
         await bot.send_message(
             target.id,
-            f"🎉 Вы назначены <b>суперадмином бота</b> в сети чатов!\n"
-            f"Вам доступны все команды модерации. Используйте /help."
+            f"🎉 Вы назначены <b>суперадмином бота</b>!\n"
+            f"Напишите мне /panel для управления группами."
         )
-    except (BotBlocked, Forbidden, BadRequest):
+    except Exception:
         pass
 
 
 @dp.message_handler(commands=['rmadmin'])
 async def cmd_rmadmin(message: types.Message):
-    """Снять права суперадмина бота — только для владельца."""
     if message.from_user.id != OWNER_ID:
         return await message.reply("❌ Только владелец бота может снимать права.")
-
     target = await get_target(message)
     if not target:
         return await message.reply("Ответьте на сообщение или укажите @username.")
     if target.id == OWNER_ID:
         return await message.reply("Нельзя снять права с владельца.")
-
     ADMIN_IDS.discard(target.id)
     cursor.execute("DELETE FROM bot_admins WHERE user_id=?", (target.id,))
     conn.commit()
-
     await message.reply(f"✅ Права суперадмина бота у {mention(target)} сняты.")
 
 
 @dp.message_handler(commands=['bot_admins'])
 async def cmd_bot_admins(message: types.Message):
-    """Список суперадминов бота."""
     if not await is_admin(message.chat.id, message.from_user.id):
         return
-
     rows = cursor.execute(
         "SELECT user_id, added_at FROM bot_admins ORDER BY added_at"
     ).fetchall()
-
     if not rows:
         return await message.reply("Список суперадминов пуст.")
-
     lines = ["<b>👑 Суперадмины бота:</b>"]
     for uid, added_at in rows:
         mark = "👑" if uid == OWNER_ID else "🌟"
         date = added_at[:10] if added_at else "?"
         lines.append(f"{mark} <a href=\"tg://user?id={uid}\">{uid}</a> — с {date}")
-
     await message.reply('\n'.join(lines))
 
 
 # ══════════════════════════════════════════════════════════════
-#  ЗАПРЕЩЁННЫЕ СЛОВА — ОДИНОЧНЫЕ
+#  ЗАПРЕЩЁННЫЕ СЛОВА
 # ══════════════════════════════════════════════════════════════
+
+def _parse_bulk_words(text: str) -> list:
+    lines = text.strip().splitlines()
+    return [line.strip().lower() for line in lines
+            if line.strip() and not line.strip().startswith('/')]
+
 
 @dp.message_handler(commands=['add_word'])
 async def cmd_add_word(message: types.Message):
@@ -563,19 +924,16 @@ async def cmd_add_word(message: types.Message):
         return await message.reply("❌ Нет прав.")
     word = message.get_args().strip().lower()
     if not word:
-        return await message.reply(
-            "Использование: /add_word &lt;слово&gt;\n"
-            "Для пачки слов используйте /add_words"
-        )
+        return await message.reply("Использование: /add_word &lt;слово&gt;\nДля пачки: /add_words")
     try:
         cursor.execute(
             "INSERT INTO forbidden_words(word,scope,added_by) VALUES(?,?,?)",
             (word, 'network', message.from_user.id)
         )
         conn.commit()
-        await message.reply(f"✅ Слово <b>{word}</b> добавлено во <b>всю сеть</b>.")
+        await message.reply(f"✅ Слово <code>{word}</code> добавлено во <b>всю сеть</b>.")
     except sqlite3.IntegrityError:
-        await message.reply(f"⚠️ Слово <b>{word}</b> уже есть в сети.")
+        await message.reply(f"⚠️ Слово <code>{word}</code> уже есть в сети.")
 
 
 @dp.message_handler(commands=['del_word'])
@@ -585,14 +943,44 @@ async def cmd_del_word(message: types.Message):
     word = message.get_args().strip().lower()
     if not word:
         return await message.reply("Использование: /del_word &lt;слово&gt;")
-    cursor.execute(
-        "DELETE FROM forbidden_words WHERE word=? AND scope='network'", (word,)
-    )
+    cursor.execute("DELETE FROM forbidden_words WHERE word=? AND scope='network'", (word,))
     conn.commit()
     if cursor.rowcount:
-        await message.reply(f"✅ Слово <b>{word}</b> удалено из сети.")
+        await message.reply(f"✅ Слово <code>{word}</code> удалено из сети.")
     else:
-        await message.reply(f"⚠️ Слово <b>{word}</b> не найдено в сети.")
+        await message.reply(f"⚠️ Слово <code>{word}</code> не найдено в сети.")
+
+
+@dp.message_handler(commands=['add_words'])
+async def cmd_add_words_bulk(message: types.Message):
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return await message.reply("❌ Нет прав.")
+    raw = message.text.partition('\n')[2]
+    if not raw.strip():
+        return await message.reply(
+            "Укажите слова — каждое с новой строки:\n\n"
+            "<code>/add_words\nшлюха\nпизда\nслово3</code>"
+        )
+    words = _parse_bulk_words(raw)
+    if not words:
+        return await message.reply("Не нашёл слов для добавления.")
+    added, skipped = [], []
+    for word in words:
+        try:
+            cursor.execute(
+                "INSERT INTO forbidden_words(word,scope,added_by) VALUES(?,?,?)",
+                (word, 'network', message.from_user.id)
+            )
+            added.append(word)
+        except sqlite3.IntegrityError:
+            skipped.append(word)
+    conn.commit()
+    lines = [f"✅ Добавлено во всю сеть: <b>{len(added)}</b> слов"]
+    if added:
+        lines.append("Добавлены: " + ", ".join(f"<code>{w}</code>" for w in added))
+    if skipped:
+        lines.append("⚠️ Уже были: " + ", ".join(f"<code>{w}</code>" for w in skipped))
+    await message.reply('\n'.join(lines))
 
 
 @dp.message_handler(commands=['add_word_here'])
@@ -608,9 +996,41 @@ async def cmd_add_word_here(message: types.Message):
             (word, str(message.chat.id), message.from_user.id)
         )
         conn.commit()
-        await message.reply(f"✅ Слово <b>{word}</b> добавлено только в этот чат.")
+        await message.reply(f"✅ Слово <code>{word}</code> добавлено только в этот чат.")
     except sqlite3.IntegrityError:
-        await message.reply(f"⚠️ Слово <b>{word}</b> уже есть.")
+        await message.reply(f"⚠️ Слово <code>{word}</code> уже есть.")
+
+
+@dp.message_handler(commands=['add_words_here'])
+async def cmd_add_words_here_bulk(message: types.Message):
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return await message.reply("❌ Нет прав.")
+    raw = message.text.partition('\n')[2]
+    if not raw.strip():
+        return await message.reply(
+            "Укажите слова — каждое с новой строки:\n\n"
+            "<code>/add_words_here\nслово1\nслово2</code>"
+        )
+    words = _parse_bulk_words(raw)
+    if not words:
+        return await message.reply("Не нашёл слов для добавления.")
+    added, skipped = [], []
+    for word in words:
+        try:
+            cursor.execute(
+                "INSERT INTO forbidden_words(word,scope,added_by) VALUES(?,?,?)",
+                (word, str(message.chat.id), message.from_user.id)
+            )
+            added.append(word)
+        except sqlite3.IntegrityError:
+            skipped.append(word)
+    conn.commit()
+    lines = [f"✅ Добавлено в этот чат: <b>{len(added)}</b> слов"]
+    if added:
+        lines.append("Добавлены: " + ", ".join(f"<code>{w}</code>" for w in added))
+    if skipped:
+        lines.append("⚠️ Уже были: " + ", ".join(f"<code>{w}</code>" for w in skipped))
+    await message.reply('\n'.join(lines))
 
 
 @dp.message_handler(commands=['del_word_here'])
@@ -626,104 +1046,9 @@ async def cmd_del_word_here(message: types.Message):
     )
     conn.commit()
     if cursor.rowcount:
-        await message.reply(f"✅ Слово <b>{word}</b> удалено из этого чата.")
+        await message.reply(f"✅ Слово <code>{word}</code> удалено из этого чата.")
     else:
-        await message.reply(f"⚠️ Слово <b>{word}</b> не найдено.")
-
-
-# ══════════════════════════════════════════════════════════════
-#  ЗАПРЕЩЁННЫЕ СЛОВА — ПАЧКОЙ (через Enter)
-# ══════════════════════════════════════════════════════════════
-
-def _parse_bulk_words(text: str) -> list:
-    """Разбить текст на список слов — каждое слово с новой строки."""
-    lines = text.strip().splitlines()
-    words = []
-    for line in lines:
-        w = line.strip().lower()
-        if w and not w.startswith('/'):
-            words.append(w)
-    return words
-
-
-@dp.message_handler(commands=['add_words'])
-async def cmd_add_words_bulk(message: types.Message):
-    """
-    Добавить сразу несколько слов в сеть.
-    Формат: /add_words (новая строка) слово1 (новая строка) слово2 ...
-    """
-    if not await is_admin(message.chat.id, message.from_user.id):
-        return await message.reply("❌ Нет прав.")
-
-    # Всё, что после команды (включая многострочное)
-    raw = message.text.partition('\n')[2]  # всё после первой строки
-    if not raw.strip():
-        return await message.reply(
-            "Укажите слова — каждое с новой строки:\n\n"
-            "<code>/add_words\nшлюха\nпизда\nматерное_слово</code>"
-        )
-
-    words = _parse_bulk_words(raw)
-    if not words:
-        return await message.reply("Не нашёл слов для добавления.")
-
-    added, skipped = [], []
-    for word in words:
-        try:
-            cursor.execute(
-                "INSERT INTO forbidden_words(word,scope,added_by) VALUES(?,?,?)",
-                (word, 'network', message.from_user.id)
-            )
-            added.append(word)
-        except sqlite3.IntegrityError:
-            skipped.append(word)
-    conn.commit()
-
-    lines = [f"✅ Добавлено во всю сеть: <b>{len(added)}</b> слов"]
-    if added:
-        lines.append("Добавлены: " + ", ".join(f"<code>{w}</code>" for w in added))
-    if skipped:
-        lines.append(f"⚠️ Уже были: " + ", ".join(f"<code>{w}</code>" for w in skipped))
-
-    await message.reply('\n'.join(lines))
-
-
-@dp.message_handler(commands=['add_words_here'])
-async def cmd_add_words_here_bulk(message: types.Message):
-    """Добавить пачку слов только в этот чат."""
-    if not await is_admin(message.chat.id, message.from_user.id):
-        return await message.reply("❌ Нет прав.")
-
-    raw = message.text.partition('\n')[2]
-    if not raw.strip():
-        return await message.reply(
-            "Укажите слова — каждое с новой строки:\n\n"
-            "<code>/add_words_here\nслово1\nслово2</code>"
-        )
-
-    words = _parse_bulk_words(raw)
-    if not words:
-        return await message.reply("Не нашёл слов для добавления.")
-
-    added, skipped = [], []
-    for word in words:
-        try:
-            cursor.execute(
-                "INSERT INTO forbidden_words(word,scope,added_by) VALUES(?,?,?)",
-                (word, str(message.chat.id), message.from_user.id)
-            )
-            added.append(word)
-        except sqlite3.IntegrityError:
-            skipped.append(word)
-    conn.commit()
-
-    lines = [f"✅ Добавлено в этот чат: <b>{len(added)}</b> слов"]
-    if added:
-        lines.append("Добавлены: " + ", ".join(f"<code>{w}</code>" for w in added))
-    if skipped:
-        lines.append("⚠️ Уже были: " + ", ".join(f"<code>{w}</code>" for w in skipped))
-
-    await message.reply('\n'.join(lines))
+        await message.reply(f"⚠️ Слово <code>{word}</code> не найдено.")
 
 
 @dp.message_handler(commands=['view_words'])
@@ -733,10 +1058,8 @@ async def cmd_view_words(message: types.Message):
         "SELECT word FROM forbidden_words WHERE scope='network' ORDER BY word"
     ).fetchall()]
     local = [r[0] for r in cursor.execute(
-        "SELECT word FROM forbidden_words WHERE scope=? ORDER BY word",
-        (str(cid),)
+        "SELECT word FROM forbidden_words WHERE scope=? ORDER BY word", (str(cid),)
     ).fetchall()]
-
     if not net and not local:
         resp = await message.reply("📋 Список запрещённых слов пуст.")
     else:
@@ -748,134 +1071,7 @@ async def cmd_view_words(message: types.Message):
             lines.append(f"\n<b>Только этот чат ({len(local)}):</b>")
             lines.append(", ".join(f"<code>{w}</code>" for w in local))
         resp = await message.reply('\n'.join(lines))
-
     asyncio.create_task(auto_delete(cid, resp.message_id, 30))
-
-
-# ══════════════════════════════════════════════════════════════
-#  КАПЧА
-# ══════════════════════════════════════════════════════════════
-
-def _gen_captcha_code(length=6) -> str:
-    """Генерирует случайный код из цифр."""
-    return ''.join(random.choices(string.digits, k=length))
-
-
-async def _captcha_timeout(user_id, chat_id, code):
-    """Через CAPTCHA_TIMEOUT секунд проверяем — прошёл ли пользователь капчу."""
-    await asyncio.sleep(CAPTCHA_TIMEOUT)
-
-    row = cursor.execute(
-        "SELECT code FROM captcha_pending WHERE user_id=? AND chat_id=?",
-        (user_id, chat_id)
-    ).fetchone()
-
-    if row and row[0] == code:
-        # Не прошёл — кикаем
-        cursor.execute(
-            "DELETE FROM captcha_pending WHERE user_id=? AND chat_id=?",
-            (user_id, chat_id)
-        )
-        conn.commit()
-        try:
-            await bot.kick_chat_member(chat_id, user_id)
-            await bot.unban_chat_member(chat_id, user_id)  # разбан чтобы мог вернуться
-        except (BadRequest, Forbidden):
-            pass
-
-        # Уведомление в чате
-        try:
-            chat = await bot.get_chat(chat_id)
-            msg = await bot.send_message(
-                chat_id,
-                f"🚫 Пользователь не прошёл капчу за {CAPTCHA_TIMEOUT} сек и был кикнут."
-            )
-            asyncio.create_task(auto_delete(chat_id, msg.message_id, 30))
-        except Exception:
-            pass
-
-        # Пишем в ЛС что кикнули
-        try:
-            await bot.send_message(
-                user_id,
-                f"❌ Вы не прошли капчу за {CAPTCHA_TIMEOUT} секунд и были удалены из чата.\n"
-                f"Вы можете вернуться и попробовать снова."
-            )
-        except (BotBlocked, Forbidden, BadRequest):
-            pass
-
-
-@dp.message_handler(content_types=types.ContentType.NEW_CHAT_MEMBERS)
-async def on_new_member(message: types.Message):
-    """Обработчик входа новых участников."""
-    chat_id = message.chat.id
-
-    if not get_setting(chat_id, 'captcha'):
-        return  # капча выключена
-
-    for user in message.new_chat_members:
-        if user.is_bot:
-            continue
-
-        uid  = user.id
-        code = _gen_captcha_code()
-
-        # Замутить до прохождения капчи
-        try:
-            await bot.restrict_chat_member(
-                chat_id, uid,
-                permissions=ChatPermissions(can_send_messages=False)
-            )
-        except (BadRequest, Forbidden):
-            pass
-
-        # Сохранить в БД
-        cursor.execute(
-            "INSERT OR REPLACE INTO captcha_pending(user_id,chat_id,code,created_at)"
-            " VALUES(?,?,?,?)",
-            (uid, chat_id, code, int(time.time()))
-        )
-        conn.commit()
-
-        # Написать в ЛС
-        dm_sent = False
-        try:
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton(
-                "✅ Я не бот — ввожу код в группе",
-                url=f"https://t.me/{(await bot.get_me()).username}?start=captcha"
-            ))
-            await bot.send_message(
-                uid,
-                f"👋 Привет! Вы вступили в чат.\n\n"
-                f"Для подтверждения того, что вы не бот, введите в <b>группе</b> следующий код:\n\n"
-                f"<code>{code}</code>\n\n"
-                f"⏱ У вас есть <b>{CAPTCHA_TIMEOUT} секунд</b>.\n"
-                f"Если не введёте — вас кикнут автоматически.",
-                reply_markup=kb
-            )
-            dm_sent = True
-        except (BotBlocked, Forbidden, BadRequest):
-            dm_sent = False
-
-        # Сообщение в чате
-        if dm_sent:
-            chat_msg = await message.reply(
-                f"👋 {mention(user)}, добро пожаловать!\n\n"
-                f"🔐 Для верификации проверьте <b>личные сообщения от бота</b> — "
-                f"там есть код, который нужно написать здесь.\n"
-                f"⏱ Время: {CAPTCHA_TIMEOUT} сек."
-            )
-        else:
-            # ЛС заблокированы — показываем код прямо в чате
-            chat_msg = await message.reply(
-                f"👋 {mention(user)}, добро пожаловать!\n\n"
-                f"🔐 Введите этот код для верификации:\n<code>{code}</code>\n\n"
-                f"⏱ У вас есть {CAPTCHA_TIMEOUT} секунд."
-            )
-
-        asyncio.create_task(_captcha_timeout(uid, chat_id, code))
-        asyncio.create_task(auto_delete(chat_id, chat_msg.message_id, CAPTCHA_TIMEOUT + 5))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -891,22 +1087,18 @@ async def cmd_warn(message: types.Message):
         return await message.reply("Ответьте на сообщение или укажите @пользователя.")
     if target.is_bot or target.id in ADMIN_IDS:
         return await message.reply("Нельзя предупредить бота или суперадмина.")
-
     args   = message.get_args().split()
     reason = ' '.join(args[1:] if not message.reply_to_message else args) or 'нарушение правил'
-
-    max_w = get_setting(message.chat.id, 'max_warnings')
-    count = add_warning(target.id, message.chat.id, reason, message.from_user.id)
+    max_w  = get_setting(message.chat.id, 'max_warnings')
+    count  = add_warning(target.id, message.chat.id, reason, message.from_user.id)
     log_violation(target.id, message.chat.id, 'warn', reason)
-    bar = "🟥" * count + "⬜" * (max_w - count)
-
+    bar    = "🟥" * count + "⬜" * (max_w - count)
     if count >= max_w:
         clear_warnings(target.id, message.chat.id)
         await do_mute(message.chat.id, target.id, MUTE_SECONDS)
-        action = f"🔇 Автоматически замучен на 1 час (достигнут лимит {max_w})."
+        action = f"🔇 Автоматически замучен на 1 час (лимит {max_w})."
     else:
         action = f"Варны: {count}/{max_w} {bar}"
-
     await message.reply(
         f"⚠️ {mention(target)} получает предупреждение!\n"
         f"Причина: <i>{reason}</i>\n{action}"
@@ -946,11 +1138,9 @@ async def cmd_mute(message: types.Message):
         return await message.reply("Ответьте на сообщение или укажите @пользователя.")
     if target.id in ADMIN_IDS:
         return await message.reply("Нельзя замутить суперадмина.")
-
     args    = message.get_args().split()
     dur_str = args[-1] if args else '1h'
     seconds = parse_duration(dur_str)
-
     ok = await do_mute(message.chat.id, target.id, seconds)
     if ok:
         await message.reply(f"🔇 {mention(target)} замучен на <b>{dur_str}</b>.")
@@ -1036,135 +1226,6 @@ async def cmd_unban(message: types.Message):
 
 
 # ══════════════════════════════════════════════════════════════
-#  НАСТРОЙКИ ЧАТА — Inline панель
-# ══════════════════════════════════════════════════════════════
-
-SETTING_LABELS = {
-    'anti_flood':   'Антифлуд',
-    'anti_links':   'Блок ссылок',
-    'anti_forward': 'Блок пересылок',
-    'sub_check':    'Проверка подписки',
-    'captcha':      'Капча',
-}
-
-
-@dp.message_handler(commands=['settings'])
-async def cmd_settings(message: types.Message):
-    if not await is_admin(message.chat.id, message.from_user.id):
-        return
-    cid = message.chat.id
-    await message.reply(
-        "<b>⚙️ Настройки чата</b>\nНажмите на кнопку чтобы переключить:",
-        reply_markup=settings_keyboard(cid)
-    )
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("toggle:"))
-async def cb_toggle(call: types.CallbackQuery):
-    _, key, chat_id_str = call.data.split(":")
-    chat_id = int(chat_id_str)
-
-    if not await is_admin(chat_id, call.from_user.id):
-        return await call.answer("❌ Нет прав.", show_alert=True)
-
-    current = get_setting(chat_id, key)
-    new_val  = 0 if current else 1
-    set_setting(chat_id, key, new_val)
-
-    label = SETTING_LABELS.get(key, key)
-    state = "включён ✅" if new_val else "выключен ❌"
-    await call.answer(f"{label} {state}")
-
-    await call.message.edit_reply_markup(reply_markup=settings_keyboard(chat_id))
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("settings_refresh:"))
-async def cb_settings_refresh(call: types.CallbackQuery):
-    chat_id = int(call.data.split(":")[1])
-    if not await is_admin(chat_id, call.from_user.id):
-        return await call.answer("❌ Нет прав.", show_alert=True)
-    await call.message.edit_reply_markup(reply_markup=settings_keyboard(chat_id))
-    await call.answer("Обновлено")
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("warns_menu:"))
-async def cb_warns_menu(call: types.CallbackQuery):
-    chat_id = int(call.data.split(":")[1])
-    if not await is_admin(chat_id, call.from_user.id):
-        return await call.answer("❌ Нет прав.", show_alert=True)
-    await call.message.edit_text(
-        "<b>⚠️ Выберите максимальное количество предупреждений:</b>",
-        reply_markup=warns_keyboard(chat_id)
-    )
-    await call.answer()
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("set_warns:"))
-async def cb_set_warns(call: types.CallbackQuery):
-    _, n_str, chat_id_str = call.data.split(":")
-    chat_id = int(chat_id_str)
-    n = int(n_str)
-
-    if not await is_admin(chat_id, call.from_user.id):
-        return await call.answer("❌ Нет прав.", show_alert=True)
-
-    set_setting(chat_id, 'max_warnings', n)
-    await call.answer(f"Лимит установлен: {n}")
-    await call.message.edit_text(
-        "<b>⚙️ Настройки чата</b>\nНажмите на кнопку чтобы переключить:",
-        reply_markup=settings_keyboard(chat_id)
-    )
-
-
-def _make_toggle(command_key, label):
-    async def handler(message: types.Message):
-        if not await is_admin(message.chat.id, message.from_user.id):
-            return
-        arg = message.get_args().strip().lower()
-        if arg in ('on', '1', 'вкл'):
-            val = 1
-        elif arg in ('off', '0', 'выкл'):
-            val = 0
-        else:
-            return await message.reply(f"Использование: /{command_key} on|off")
-        set_setting(message.chat.id, command_key, val)
-        state = "включена ✅" if val else "отключена ❌"
-        await message.reply(f"{label} {state}.")
-    handler.__name__ = f"toggle_{command_key}"
-    return handler
-
-
-dp.message_handler(commands=['anti_links'])(
-    _make_toggle('anti_links', 'Блокировка ссылок')
-)
-dp.message_handler(commands=['anti_flood'])(
-    _make_toggle('anti_flood', 'Антифлуд')
-)
-dp.message_handler(commands=['anti_forward'])(
-    _make_toggle('anti_forward', 'Блокировка пересылок')
-)
-dp.message_handler(commands=['captcha'])(
-    _make_toggle('captcha', 'Капча при входе')
-)
-
-
-@dp.message_handler(commands=['on_sub'])
-async def cmd_on_sub(message: types.Message):
-    if not await is_admin(message.chat.id, message.from_user.id):
-        return
-    set_setting(message.chat.id, 'sub_check', 1)
-    await message.reply("✅ Проверка подписки включена.")
-
-
-@dp.message_handler(commands=['off_sub'])
-async def cmd_off_sub(message: types.Message):
-    if not await is_admin(message.chat.id, message.from_user.id):
-        return
-    set_setting(message.chat.id, 'sub_check', 0)
-    await message.reply("❌ Проверка подписки отключена.")
-
-
-# ══════════════════════════════════════════════════════════════
 #  СТАТИСТИКА
 # ══════════════════════════════════════════════════════════════
 
@@ -1172,42 +1233,134 @@ async def cmd_off_sub(message: types.Message):
 async def cmd_stats(message: types.Message):
     if not await is_admin(message.chat.id, message.from_user.id):
         return
-    cid = message.chat.id
-
-    cursor.execute(
-        "SELECT vtype, COUNT(*) FROM violation_log WHERE chat_id=? GROUP BY vtype",
-        (cid,)
-    )
-    viol_rows = cursor.fetchall()
-
-    cursor.execute("SELECT COUNT(*) FROM forbidden_words WHERE scope='network'")
-    net_words = cursor.fetchone()[0]
-
-    cursor.execute(
+    cid  = message.chat.id
+    rows = cursor.execute(
+        "SELECT vtype, COUNT(*) FROM violation_log WHERE chat_id=? GROUP BY vtype", (cid,)
+    ).fetchall()
+    net_words  = cursor.execute(
+        "SELECT COUNT(*) FROM forbidden_words WHERE scope='network'"
+    ).fetchone()[0]
+    chat_words = cursor.execute(
         "SELECT COUNT(*) FROM forbidden_words WHERE scope=?", (str(cid),)
-    )
-    chat_words = cursor.fetchone()[0]
-
-    total_viol = sum(c for _, c in viol_rows)
-    emoji_map  = {'flood': '💧', 'forward': '📨', 'link': '🔗',
-                  'forbidden_word': '🤬', 'warn': '⚠️', 'mute': '🔇',
-                  'kick': '👢', 'ban': '🔨'}
-
+    ).fetchone()[0]
+    emoji_map = {'flood': '💧', 'forward': '📨', 'link': '🔗',
+                 'forbidden_word': '🤬', 'warn': '⚠️', 'mute': '🔇',
+                 'kick': '👢', 'ban': '🔨'}
+    total = sum(c for _, c in rows)
     lines = [
-        "<b>📊 Статистика чата</b>",
-        f"",
+        "<b>📊 Статистика чата</b>\n",
         f"🚫 Слов в сети: <b>{net_words}</b>",
         f"📌 Слов в этом чате: <b>{chat_words}</b>",
-        f"",
-        f"⚡ Всего нарушений: <b>{total_viol}</b>",
+        f"⚡ Всего нарушений: <b>{total}</b>",
     ]
-    if viol_rows:
+    if rows:
         lines.append("")
-        for vtype, cnt in sorted(viol_rows, key=lambda x: -x[1]):
+        for vtype, cnt in sorted(rows, key=lambda x: -x[1]):
             em = emoji_map.get(vtype, '•')
             lines.append(f"{em} {vtype}: <b>{cnt}</b>")
-
     await message.reply('\n'.join(lines))
+
+
+# ══════════════════════════════════════════════════════════════
+#  КАПЧА
+# ══════════════════════════════════════════════════════════════
+
+def _gen_captcha_code(length=6) -> str:
+    return ''.join(random.choices(string.digits, k=length))
+
+
+async def _captcha_timeout(user_id, chat_id, code):
+    await asyncio.sleep(CAPTCHA_TIMEOUT)
+    row = cursor.execute(
+        "SELECT code FROM captcha_pending WHERE user_id=? AND chat_id=?",
+        (user_id, chat_id)
+    ).fetchone()
+    if row and row[0] == code:
+        cursor.execute(
+            "DELETE FROM captcha_pending WHERE user_id=? AND chat_id=?",
+            (user_id, chat_id)
+        )
+        conn.commit()
+        try:
+            await bot.kick_chat_member(chat_id, user_id)
+            await bot.unban_chat_member(chat_id, user_id)
+        except (BadRequest, Forbidden):
+            pass
+        try:
+            msg = await bot.send_message(
+                chat_id,
+                f"🚫 Пользователь не прошёл капчу за {CAPTCHA_TIMEOUT} сек и был кикнут."
+            )
+            asyncio.create_task(auto_delete(chat_id, msg.message_id, 30))
+        except Exception:
+            pass
+        try:
+            await bot.send_message(
+                user_id,
+                f"❌ Вы не прошли капчу за {CAPTCHA_TIMEOUT} секунд и были удалены из чата.\n"
+                f"Вы можете вернуться и попробовать снова."
+            )
+        except Exception:
+            pass
+
+
+@dp.message_handler(content_types=types.ContentType.NEW_CHAT_MEMBERS)
+async def on_new_member(message: types.Message):
+    chat_id = message.chat.id
+    register_chat(chat_id, message.chat.title or str(chat_id))
+
+    if not get_setting(chat_id, 'captcha'):
+        return
+
+    for user in message.new_chat_members:
+        if user.is_bot:
+            continue
+        uid  = user.id
+        code = _gen_captcha_code()
+        try:
+            await bot.restrict_chat_member(
+                chat_id, uid,
+                permissions=ChatPermissions(can_send_messages=False)
+            )
+        except (BadRequest, Forbidden):
+            pass
+
+        cursor.execute(
+            "INSERT OR REPLACE INTO captcha_pending(user_id,chat_id,code,created_at)"
+            " VALUES(?,?,?,?)",
+            (uid, chat_id, code, int(time.time()))
+        )
+        conn.commit()
+
+        dm_sent = False
+        try:
+            await bot.send_message(
+                uid,
+                f"👋 Привет! Вы вступили в чат <b>{message.chat.title}</b>.\n\n"
+                f"Введите этот код в группе для верификации:\n\n"
+                f"<code>{code}</code>\n\n"
+                f"⏱ У вас есть <b>{CAPTCHA_TIMEOUT} секунд</b>.\n"
+                f"Если не введёте — вас кикнут автоматически."
+            )
+            dm_sent = True
+        except Exception:
+            pass
+
+        if dm_sent:
+            chat_msg = await message.reply(
+                f"👋 {mention(user)}, добро пожаловать!\n\n"
+                f"🔐 Проверьте <b>личные сообщения от бота</b> — введите там указанный код здесь.\n"
+                f"⏱ Время: <b>{CAPTCHA_TIMEOUT} сек</b>."
+            )
+        else:
+            chat_msg = await message.reply(
+                f"👋 {mention(user)}, добро пожаловать!\n\n"
+                f"🔐 Введите код для верификации:\n<code>{code}</code>\n\n"
+                f"⏱ У вас есть <b>{CAPTCHA_TIMEOUT} секунд</b>."
+            )
+
+        asyncio.create_task(_captcha_timeout(uid, chat_id, code))
+        asyncio.create_task(auto_delete(chat_id, chat_msg.message_id, CAPTCHA_TIMEOUT + 5))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1233,26 +1386,24 @@ async def process_message(message: types.Message):
     if not user or user.is_bot:
         return
     if chat.type not in (types.ChatType.GROUP, types.ChatType.SUPERGROUP):
-        # В ЛС — проверка кода капчи
-        if chat.type == types.ChatType.PRIVATE:
-            return  # капча вводится в группе, не в лс
         return
 
     uid   = user.id
     cid   = chat.id
     admin = await is_admin(cid, uid)
 
-    # -- Проверка капчи (пользователь вводит код в чате) --------
+    # Регистрируем/обновляем чат
+    register_chat(cid, chat.title or str(cid))
+
+    # -- Проверка капчи -------------------------------------------
     row = cursor.execute(
         "SELECT code FROM captcha_pending WHERE user_id=? AND chat_id=?",
         (uid, cid)
     ).fetchone()
-
     if row:
         expected = row[0]
-        text_raw  = (message.text or '').strip()
+        text_raw = (message.text or '').strip()
         if text_raw == expected:
-            # Верно! Снять мут, удалить из pending
             cursor.execute(
                 "DELETE FROM captcha_pending WHERE user_id=? AND chat_id=?",
                 (uid, cid)
@@ -1272,18 +1423,15 @@ async def process_message(message: types.Message):
                 pass
             await safe_delete(cid, message.message_id)
             resp = await bot.send_message(
-                cid,
-                f"✅ {mention(user)} прошёл верификацию! Добро пожаловать!"
+                cid, f"✅ {mention(user)} прошёл верификацию! Добро пожаловать!"
             )
             asyncio.create_task(auto_delete(cid, resp.message_id, 15))
-
             try:
                 await bot.send_message(uid, "✅ Вы успешно прошли капчу! Можете писать в чате.")
-            except (BotBlocked, Forbidden, BadRequest):
+            except Exception:
                 pass
             return
         else:
-            # Неверный код — удалить сообщение, ничего не говорить
             await safe_delete(cid, message.message_id)
             return
 
@@ -1293,19 +1441,17 @@ async def process_message(message: types.Message):
         ok = await do_mute(cid, uid, 300)
         if ok:
             resp = await bot.send_message(
-                cid,
-                f"💧 {mention(user)}, флуд запрещён. Мут на 5 минут."
+                cid, f"💧 {mention(user)}, флуд запрещён. Мут на 5 минут."
             )
             asyncio.create_task(auto_delete(cid, resp.message_id))
         log_violation(uid, cid, 'flood')
         return
 
-    # -- Блок пересылок из каналов ---------------------------------
+    # -- Блок пересылок --------------------------------------------
     if not admin and get_setting(cid, 'anti_forward') and message.forward_from_chat:
         await safe_delete(cid, message.message_id)
         resp = await bot.send_message(
-            cid,
-            f"📨 {mention(user)}, пересылки из каналов запрещены в этом чате."
+            cid, f"📨 {mention(user)}, пересылки из каналов запрещены."
         )
         asyncio.create_task(auto_delete(cid, resp.message_id))
         log_violation(uid, cid, 'forward')
@@ -1319,7 +1465,7 @@ async def process_message(message: types.Message):
     # -- Блок ссылок -----------------------------------------------
     if not admin and get_setting(cid, 'anti_links'):
         entities = message.entities or []
-        if any(e.type in ('url', 'text_link') for e in entities):
+        if any(ent.type in ('url', 'text_link') for ent in entities):
             await safe_delete(cid, message.message_id)
             resp = await bot.send_message(
                 cid,
@@ -1340,7 +1486,6 @@ async def process_message(message: types.Message):
             count = add_warning(uid, cid, f'запрещённое слово: {found}', 0)
             log_violation(uid, cid, 'forbidden_word', text)
             bar = "🟥" * count + "⬜" * (max_w - count)
-
             if count >= max_w:
                 clear_warnings(uid, cid)
                 await do_mute(cid, uid, MUTE_SECONDS)
@@ -1365,7 +1510,6 @@ async def process_message(message: types.Message):
             subscribed = member.status not in ('left', 'kicked')
         except Exception:
             subscribed = True
-
         if not subscribed:
             await safe_delete(cid, message.message_id)
             resp = await bot.send_message(
