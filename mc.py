@@ -47,6 +47,15 @@ FLOOD_LIMIT     = 5
 FLOOD_WINDOW    = 10
 CAPTCHA_TIMEOUT = 120
 
+DEFAULT_CHAT_SETTINGS = {
+    'sub_check': 0,
+    'anti_flood': 1,
+    'anti_forward': 1,
+    'anti_links': 1,
+    'captcha': 0,
+    'max_warnings': 3,
+}
+
 # ══════════════════════════════════════════════════════════════
 #  БАЗА ДАННЫХ
 # ══════════════════════════════════════════════════════════════
@@ -87,10 +96,15 @@ def init_db():
             chat_title   TEXT    DEFAULT '',
             sub_check    INTEGER DEFAULT 0,
             anti_flood   INTEGER DEFAULT 1,
-            anti_forward INTEGER DEFAULT 0,
+            anti_forward INTEGER DEFAULT 1,
             anti_links   INTEGER DEFAULT 1,
             captcha      INTEGER DEFAULT 0,
             max_warnings INTEGER DEFAULT 3
+        );
+
+        CREATE TABLE IF NOT EXISTS bot_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
         );
 
         CREATE TABLE IF NOT EXISTS violation_log (
@@ -123,6 +137,24 @@ def init_db():
         "INSERT OR IGNORE INTO bot_admins(user_id, added_by) VALUES(?,?)",
         (OWNER_ID, OWNER_ID)
     )
+
+    migrated = cursor.execute(
+        "SELECT value FROM bot_meta WHERE key='defaults_v2_applied'"
+    ).fetchone()
+    if not migrated:
+        cursor.execute(
+            """
+            UPDATE chat_settings
+            SET anti_links=1,
+                anti_flood=1,
+                anti_forward=1,
+                captcha=0,
+                sub_check=0
+            """
+        )
+        cursor.execute(
+            "INSERT OR REPLACE INTO bot_meta(key, value) VALUES('defaults_v2_applied', '1')"
+        )
     conn.commit()
 
 
@@ -180,14 +212,27 @@ def get_setting(chat_id, key):
     row = cursor.fetchone()
     if row:
         return row[0]
-    defaults = dict(sub_check=0, anti_flood=1, anti_forward=0,
-                    anti_links=1, captcha=0, max_warnings=3, chat_title='')
-    return defaults.get(key, 0)
+    if key == 'chat_title':
+        return ''
+    return DEFAULT_CHAT_SETTINGS.get(key, 0)
 
 
 def set_setting(chat_id, key, value):
     cursor.execute(
-        "INSERT OR IGNORE INTO chat_settings(chat_id) VALUES(?)", (chat_id,)
+        """
+        INSERT OR IGNORE INTO chat_settings(
+            chat_id, sub_check, anti_flood, anti_forward, anti_links, captcha, max_warnings
+        ) VALUES(?,?,?,?,?,?,?)
+        """,
+        (
+            chat_id,
+            DEFAULT_CHAT_SETTINGS['sub_check'],
+            DEFAULT_CHAT_SETTINGS['anti_flood'],
+            DEFAULT_CHAT_SETTINGS['anti_forward'],
+            DEFAULT_CHAT_SETTINGS['anti_links'],
+            DEFAULT_CHAT_SETTINGS['captcha'],
+            DEFAULT_CHAT_SETTINGS['max_warnings'],
+        )
     )
     cursor.execute(
         f"UPDATE chat_settings SET {key}=? WHERE chat_id=?", (value, chat_id)
@@ -198,8 +243,21 @@ def set_setting(chat_id, key, value):
 def register_chat(chat_id, title):
     """Регистрируем/обновляем чат в БД."""
     cursor.execute(
-        "INSERT OR IGNORE INTO chat_settings(chat_id, chat_title) VALUES(?,?)",
-        (chat_id, title)
+        """
+        INSERT OR IGNORE INTO chat_settings(
+            chat_id, chat_title, sub_check, anti_flood, anti_forward, anti_links, captcha, max_warnings
+        ) VALUES(?,?,?,?,?,?,?,?)
+        """,
+        (
+            chat_id,
+            title,
+            DEFAULT_CHAT_SETTINGS['sub_check'],
+            DEFAULT_CHAT_SETTINGS['anti_flood'],
+            DEFAULT_CHAT_SETTINGS['anti_forward'],
+            DEFAULT_CHAT_SETTINGS['anti_links'],
+            DEFAULT_CHAT_SETTINGS['captcha'],
+            DEFAULT_CHAT_SETTINGS['max_warnings'],
+        )
     )
     cursor.execute(
         "UPDATE chat_settings SET chat_title=? WHERE chat_id=?",
@@ -326,13 +384,14 @@ def settings_text(chat_id, title=None) -> str:
         header += f": {title}"
     return (
         f"{header}\n\n"
-        f"{af} Антифлуд\n"
-        f"{al} Блок ссылок\n"
-        f"{afw} Блок пересылок\n"
-        f"{sc} Проверка подписки\n"
-        f"{cap} Капча при входе\n"
-        f"⚠️ Макс. предупреждений: <b>{mw}</b>\n\n"
-        f"Нажмите кнопку для переключения:"
+        f"Команды (показывают текущее состояние):\n"
+        f"/anti_links {al} on|off - 🔗 блокировка ссылок\n"
+        f"/anti_flood {af} on|off - 💧 защита от флуда\n"
+        f"/anti_forward {afw} on|off - 📨 блокировка пересылок\n"
+        f"/captcha {cap} on|off - 🔐 капча при входе\n"
+        f"/sub {sc} - 📢 проверка подписки\n\n"
+        f"⚠️ Макс. предупреждений: <b>{mw}</b>\n"
+        f"<i>✅ - включено  ❌ - выключено</i>"
     )
 
 
@@ -446,11 +505,11 @@ HELP_SECTIONS = {
         "⚙️ <b>Настройки чата</b>\n\n"
         "/settings — панель настроек с кнопками\n\n"
         "Команды (показывают текущее состояние):\n"
-        "/anti_links on|off — 🔗 блокировка ссылок\n"
-        "/anti_flood on|off — 💧 защита от флуда\n"
-        "/anti_forward on|off — 📨 блокировка пересылок\n"
-        "/captcha on|off — 🔐 капча при входе\n"
-        "/on_sub | /off_sub — 📢 проверка подписки\n\n"
+        "/anti_links ✅ on|off — 🔗 блокировка ссылок\n"
+        "/anti_flood ✅ on|off — 💧 защита от флуда\n"
+        "/anti_forward ✅ on|off — 📨 блокировка пересылок\n"
+        "/captcha ❌ on|off — 🔐 капча при входе\n"
+        "/sub ✅ — 📢 проверка подписки\n\n"
         "<i>✅ — включено  ❌ — выключено</i>"
     ),
     "admins": (
@@ -589,6 +648,13 @@ async def cb_pm_groups(call: types.CallbackQuery):
         reply_markup=groups_list_keyboard(chats)
     )
     await call.answer()
+
+
+@dp.my_chat_member_handler()
+async def on_bot_chat_member_update(update: types.ChatMemberUpdated):
+    chat = update.chat
+    if chat.type in (types.ChatType.GROUP, types.ChatType.SUPERGROUP):
+        register_chat(chat.id, chat.title or str(chat.id))
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("pm:chat:"))
@@ -798,12 +864,15 @@ def _make_toggle_cmd(command_key, label):
             return
         cid = message.chat.id
         arg = message.get_args().strip().lower()
-        if arg in ('on', '1', 'вкл'):
+        cur = get_setting(cid, command_key)
+
+        if not arg:
+            val = 0 if cur else 1
+        elif arg in ('on', '1', 'вкл'):
             val = 1
         elif arg in ('off', '0', 'выкл'):
             val = 0
         else:
-            cur   = get_setting(cid, command_key)
             state = "✅ включена" if cur else "❌ выключена"
             return await message.reply(
                 f"{label}: <b>{state}</b>\n"
@@ -820,6 +889,32 @@ dp.message_handler(commands=['anti_links'])(_make_toggle_cmd('anti_links',   '�
 dp.message_handler(commands=['anti_flood'])(_make_toggle_cmd('anti_flood',   '💧 Антифлуд'))
 dp.message_handler(commands=['anti_forward'])(_make_toggle_cmd('anti_forward','📨 Блокировка пересылок'))
 dp.message_handler(commands=['captcha'])(_make_toggle_cmd('captcha',         '🔐 Капча при входе'))
+
+
+@dp.message_handler(commands=['sub'])
+async def cmd_sub(message: types.Message):
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return
+
+    arg = message.get_args().strip().lower()
+    cur = get_setting(message.chat.id, 'sub_check')
+
+    if not arg:
+        val = 0 if cur else 1
+    elif arg in ('on', '1', 'вкл'):
+        val = 1
+    elif arg in ('off', '0', 'выкл'):
+        val = 0
+    else:
+        state = "✅ включена" if cur else "❌ выключена"
+        return await message.reply(
+            f"📢 Проверка подписки: <b>{state}</b>\n"
+            f"Использование: /sub on|off"
+        )
+
+    set_setting(message.chat.id, 'sub_check', val)
+    state = "✅ включена" if val else "❌ выключена"
+    await message.reply(f"📢 Проверка подписки: <b>{state}</b>")
 
 
 @dp.message_handler(commands=['on_sub'])
