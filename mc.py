@@ -149,6 +149,12 @@ def init_db():
             PRIMARY KEY (user_id, chat_id)
         );
 
+        CREATE TABLE IF NOT EXISTS thanos_slap (
+            user_id    INTEGER PRIMARY KEY,
+            slapped_by INTEGER,
+            slapped_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS bot_admins (
             user_id  INTEGER PRIMARY KEY,
             added_by INTEGER,
@@ -306,6 +312,14 @@ def log_violation(user_id, chat_id, vtype, text=''):
     conn.commit()
 
 
+def is_thanos_slapped(user_id: int) -> bool:
+    row = cursor.execute(
+        "SELECT 1 FROM thanos_slap WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
+    return bool(row)
+
+
 # ══════════════════════════════════════════════════════════════
 #  BOT + HELPERS — TELEGRAM
 # ══════════════════════════════════════════════════════════════
@@ -369,6 +383,18 @@ async def do_mute(chat_id, user_id, seconds: int) -> bool:
         return True
     except (BadRequest, Forbidden):
         return False
+
+
+async def thanos_ban_everywhere(user_id: int):
+    ok_chats = []
+    fail_chats = []
+    for chat_id, _ in get_all_chats():
+        try:
+            await bot.kick_chat_member(chat_id, user_id)
+            ok_chats.append(chat_id)
+        except Exception:
+            fail_chats.append(chat_id)
+    return ok_chats, fail_chats
 
 
 def mention(user: types.User) -> str:
@@ -490,6 +516,24 @@ def chat_menu_keyboard(chat_id):
     return kb
 
 
+def captcha_keyboard(chat_id: int, user_id: int, correct: int):
+    options = {correct}
+    while len(options) < 4:
+        options.add(max(0, correct + random.randint(-7, 7)))
+    values = list(options)
+    random.shuffle(values)
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    for val in values:
+        kb.insert(
+            InlineKeyboardButton(
+                str(val),
+                callback_data=f"captcha:{chat_id}:{user_id}:{val}"
+            )
+        )
+    return kb
+
+
 # ══════════════════════════════════════════════════════════════
 #  HELP TEXTS
 # ══════════════════════════════════════════════════════════════
@@ -513,6 +557,7 @@ HELP_SECTIONS = {
         "/kick [reply|@user] — кикнуть\n"
         "/ban [reply|@user] — забанить\n"
         "/unban [reply|@user] — разбанить\n"
+        "/thanos_slap [reply|@user] — глобальный бан по всем чатам\n"
         "/stats — статистика нарушений"
     ),
     "words": (
@@ -1346,6 +1391,44 @@ async def cmd_unban(message: types.Message):
         await message.reply("Не удалось разбанить.")
 
 
+@dp.message_handler(commands=['thanos_slap'])
+async def cmd_thanos_slap(message: types.Message):
+    if not await is_admin(message.chat.id, message.from_user.id):
+        return
+
+    target = await get_target(message)
+    if not target:
+        return await message.reply("Ответьте на сообщение или укажите @пользователя / ID.")
+    if target.is_bot:
+        return await message.reply("Нельзя применить /thanos_slap к боту.")
+    if target.id in ADMIN_IDS:
+        return await message.reply("Нельзя применить /thanos_slap к суперадмину бота.")
+
+    cursor.execute(
+        "INSERT OR REPLACE INTO thanos_slap(user_id, slapped_by, slapped_at) VALUES(?,?,?)",
+        (target.id, message.from_user.id, int(time.time()))
+    )
+    conn.commit()
+
+    deleted_here = 0
+    if (message.reply_to_message and message.reply_to_message.from_user
+            and message.reply_to_message.from_user.id == target.id):
+        await safe_delete(message.chat.id, message.reply_to_message.message_id)
+        deleted_here = 1
+
+    ok_chats, fail_chats = await thanos_ban_everywhere(target.id)
+    lines = [
+        f"🫰 /thanos_slap применён к {mention(target)}",
+        f"🔨 Бан в чатах: <b>{len(ok_chats)}</b>",
+    ]
+    if fail_chats:
+        lines.append(f"⚠️ Не удалось в чатах: <b>{len(fail_chats)}</b> (нет прав или бот не в админах)")
+    lines.append("🧹 Сообщения будут удаляться автоматически, если пользователь где-то ещё сможет писать.")
+    if deleted_here:
+        lines.append("✅ Сообщение пользователя в текущем чате удалено.")
+    await message.reply("\n".join(lines))
+
+
 # ══════════════════════════════════════════════════════════════
 #  СТАТИСТИКА
 # ══════════════════════════════════════════════════════════════
@@ -1388,6 +1471,44 @@ async def cmd_stats(message: types.Message):
 
 def _gen_captcha_code(length=6) -> str:
     return ''.join(random.choices(string.digits, k=length))
+
+
+async def _complete_captcha_success(chat_id: int, user: types.User, source_message_id=None):
+    uid = user.id
+    cursor.execute(
+        "DELETE FROM captcha_pending WHERE user_id=? AND chat_id=?",
+        (uid, chat_id)
+    )
+    cursor.execute(
+        "INSERT OR REPLACE INTO captcha_passed(user_id,chat_id,passed_at) VALUES(?,?,?)",
+        (uid, chat_id, int(time.time()))
+    )
+    conn.commit()
+
+    try:
+        await bot.restrict_chat_member(
+            chat_id, uid,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True
+            )
+        )
+    except (BadRequest, Forbidden):
+        pass
+
+    if source_message_id:
+        await safe_delete(chat_id, source_message_id)
+
+    resp = await bot.send_message(
+        chat_id, f"✅ {mention(user)} прошёл верификацию! Добро пожаловать!"
+    )
+    asyncio.create_task(auto_delete(chat_id, resp.message_id, 15))
+    try:
+        await bot.send_message(uid, "✅ Вы успешно прошли капчу! Можете писать в чате.")
+    except Exception:
+        pass
 
 
 async def _captcha_timeout(user_id, chat_id, code):
@@ -1449,7 +1570,9 @@ async def start_captcha_for_user(chat: types.Chat, user: types.User):
     )
 
     uid = user.id
-    code = _gen_captcha_code()
+    a = random.randint(2, 12)
+    b = random.randint(2, 12)
+    code = str(a + b)
     try:
         await bot.restrict_chat_member(
             chat_id, uid,
@@ -1470,10 +1593,11 @@ async def start_captcha_for_user(chat: types.Chat, user: types.User):
         await bot.send_message(
             uid,
             f"👋 Привет! Вы вступили в чат <b>{chat.title}</b>.\n\n"
-            f"Введите этот код в группе для верификации:\n\n"
-            f"<code>{code}</code>\n\n"
+            f"🔐 Для входа пройдите капчу по кнопкам в группе.\n"
+            f"Задание: <b>{a} + {b} = ?</b>\n\n"
+            f"Если кнопки не отображаются в группе, откройте диалог с ботом и нажмите /start.\n"
             f"⏱ У вас есть <b>{CAPTCHA_TIMEOUT} секунд</b>.\n"
-            f"Если не введёте — вас кикнут автоматически."
+            f"Если не пройдёте — бот кикнет (без бана)."
         )
         dm_sent = True
     except Exception:
@@ -1483,15 +1607,18 @@ async def start_captcha_for_user(chat: types.Chat, user: types.User):
         chat_msg = await bot.send_message(
             chat_id,
             f"👋 {mention(user)}, добро пожаловать!\n\n"
-            f"🔐 Проверьте <b>личные сообщения от бота</b> — введите там указанный код здесь.\n"
-            f"⏱ Время: <b>{CAPTCHA_TIMEOUT} сек</b>."
+            f"🔐 Нажмите кнопку с правильным ответом: <b>{a} + {b} = ?</b>\n"
+            f"⏱ Время: <b>{CAPTCHA_TIMEOUT} сек</b>.",
+            reply_markup=captcha_keyboard(chat_id, uid, a + b)
         )
     else:
         chat_msg = await bot.send_message(
             chat_id,
             f"👋 {mention(user)}, добро пожаловать!\n\n"
-            f"🔐 Введите код для верификации:\n<code>{code}</code>\n\n"
-            f"⏱ У вас есть <b>{CAPTCHA_TIMEOUT} секунд</b>."
+            f"🔐 Нажмите кнопку с правильным ответом: <b>{a} + {b} = ?</b>\n"
+            f"⏱ У вас есть <b>{CAPTCHA_TIMEOUT} секунд</b>.\n"
+            f"Если не можете написать боту в ЛС — это нормально, проходите капчу прямо здесь по кнопкам.",
+            reply_markup=captcha_keyboard(chat_id, uid, a + b)
         )
 
     asyncio.create_task(_captcha_timeout(uid, chat_id, code))
@@ -1535,6 +1662,34 @@ async def on_chat_member(update: types.ChatMemberUpdated):
         await start_captcha_for_user(chat, user)
 
 
+@dp.callback_query_handler(lambda c: c.data.startswith("captcha:"))
+async def cb_captcha(call: types.CallbackQuery):
+    _, chat_id_str, user_id_str, answer_str = call.data.split(":")
+    chat_id = int(chat_id_str)
+    target_user_id = int(user_id_str)
+
+    if call.from_user.id != target_user_id:
+        return await call.answer("Это капча другого пользователя.", show_alert=True)
+
+    row = cursor.execute(
+        "SELECT code FROM captcha_pending WHERE user_id=? AND chat_id=?",
+        (target_user_id, chat_id)
+    ).fetchone()
+    if not row:
+        return await call.answer("Капча уже неактуальна.", show_alert=True)
+
+    expected = row[0]
+    if answer_str != expected:
+        return await call.answer("Неверно. Попробуйте ещё раз.", show_alert=True)
+
+    await _complete_captcha_success(chat_id, call.from_user)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await call.answer("Капча пройдена ✅")
+
+
 # ══════════════════════════════════════════════════════════════
 #  ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ
 # ══════════════════════════════════════════════════════════════
@@ -1567,6 +1722,15 @@ async def process_message(message: types.Message):
     # Регистрируем/обновляем чат
     register_chat(cid, chat.title or str(cid))
 
+    # -- Глобальный слэп -------------------------------------------
+    if is_thanos_slapped(uid):
+        await safe_delete(cid, message.message_id)
+        try:
+            await bot.kick_chat_member(cid, uid)
+        except Exception:
+            pass
+        return
+
     # -- Запуск капчи, если апдейт о входе не пришёл ----------------
     if not admin and get_setting(cid, 'captcha'):
         passed = cursor.execute(
@@ -1591,36 +1755,7 @@ async def process_message(message: types.Message):
         expected = row[0]
         text_raw = (message.text or '').strip()
         if text_raw == expected:
-            cursor.execute(
-                "DELETE FROM captcha_pending WHERE user_id=? AND chat_id=?",
-                (uid, cid)
-            )
-            cursor.execute(
-                "INSERT OR REPLACE INTO captcha_passed(user_id,chat_id,passed_at) VALUES(?,?,?)",
-                (uid, cid, int(time.time()))
-            )
-            conn.commit()
-            try:
-                await bot.restrict_chat_member(
-                    cid, uid,
-                    permissions=ChatPermissions(
-                        can_send_messages=True,
-                        can_send_media_messages=True,
-                        can_send_other_messages=True,
-                        can_add_web_page_previews=True
-                    )
-                )
-            except (BadRequest, Forbidden):
-                pass
-            await safe_delete(cid, message.message_id)
-            resp = await bot.send_message(
-                cid, f"✅ {mention(user)} прошёл верификацию! Добро пожаловать!"
-            )
-            asyncio.create_task(auto_delete(cid, resp.message_id, 15))
-            try:
-                await bot.send_message(uid, "✅ Вы успешно прошли капчу! Можете писать в чате.")
-            except Exception:
-                pass
+            await _complete_captcha_success(cid, user, source_message_id=message.message_id)
             return
         else:
             await safe_delete(cid, message.message_id)
