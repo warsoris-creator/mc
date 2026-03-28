@@ -15,6 +15,7 @@ mc.py — Бот защиты сети чатов (aiogram 2.x) — УЛУЧШЕ
 """
 
 import logging
+import aiogram
 import sqlite3
 import time
 import asyncio
