@@ -142,6 +142,13 @@ def init_db():
             PRIMARY KEY (user_id, chat_id)
         );
 
+        CREATE TABLE IF NOT EXISTS captcha_passed (
+            user_id   INTEGER NOT NULL,
+            chat_id   INTEGER NOT NULL,
+            passed_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, chat_id)
+        );
+
         CREATE TABLE IF NOT EXISTS bot_admins (
             user_id  INTEGER PRIMARY KEY,
             added_by INTEGER,
@@ -1436,6 +1443,11 @@ async def start_captcha_for_user(chat: types.Chat, user: types.User):
     if exists:
         return
 
+    cursor.execute(
+        "DELETE FROM captcha_passed WHERE user_id=? AND chat_id=?",
+        (user.id, chat_id)
+    )
+
     uid = user.id
     code = _gen_captcha_code()
     try:
@@ -1507,6 +1519,18 @@ async def on_chat_member(update: types.ChatMemberUpdated):
     new_status = update.new_chat_member.status
     user = update.new_chat_member.user
 
+    if new_status in ('left', 'kicked'):
+        cursor.execute(
+            "DELETE FROM captcha_passed WHERE user_id=? AND chat_id=?",
+            (user.id, chat.id)
+        )
+        cursor.execute(
+            "DELETE FROM captcha_pending WHERE user_id=? AND chat_id=?",
+            (user.id, chat.id)
+        )
+        conn.commit()
+        return
+
     if (not _is_member_status(old_status)) and _is_member_status(new_status):
         await start_captcha_for_user(chat, user)
 
@@ -1543,6 +1567,21 @@ async def process_message(message: types.Message):
     # Регистрируем/обновляем чат
     register_chat(cid, chat.title or str(cid))
 
+    # -- Запуск капчи, если апдейт о входе не пришёл ----------------
+    if not admin and get_setting(cid, 'captcha'):
+        passed = cursor.execute(
+            "SELECT 1 FROM captcha_passed WHERE user_id=? AND chat_id=?",
+            (uid, cid)
+        ).fetchone()
+        pending = cursor.execute(
+            "SELECT 1 FROM captcha_pending WHERE user_id=? AND chat_id=?",
+            (uid, cid)
+        ).fetchone()
+        if not passed and not pending:
+            await safe_delete(cid, message.message_id)
+            await start_captcha_for_user(chat, user)
+            return
+
     # -- Проверка капчи -------------------------------------------
     row = cursor.execute(
         "SELECT code FROM captcha_pending WHERE user_id=? AND chat_id=?",
@@ -1555,6 +1594,10 @@ async def process_message(message: types.Message):
             cursor.execute(
                 "DELETE FROM captcha_pending WHERE user_id=? AND chat_id=?",
                 (uid, cid)
+            )
+            cursor.execute(
+                "INSERT OR REPLACE INTO captcha_passed(user_id,chat_id,passed_at) VALUES(?,?,?)",
+                (uid, cid, int(time.time()))
             )
             conn.commit()
             try:
@@ -1680,4 +1723,15 @@ if __name__ == '__main__':
     init_db()
     dp.middleware.setup(LoggingMiddleware())
     logging.info("Бот запущен. Защита сети активна.")
-    executor.start_polling(dp, skip_updates=True)
+    executor.start_polling(
+        dp,
+        skip_updates=True,
+        allowed_updates=[
+            'message',
+            'edited_message',
+            'callback_query',
+            'my_chat_member',
+            'chat_member',
+            'chat_join_request',
+        ],
+    )
