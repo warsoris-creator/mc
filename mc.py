@@ -63,6 +63,24 @@ conn   = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
 
+def ensure_chat_settings_schema():
+    existing = {
+        row[1] for row in cursor.execute("PRAGMA table_info(chat_settings)").fetchall()
+    }
+    required = {
+        'chat_title': "TEXT DEFAULT ''",
+        'sub_check': 'INTEGER DEFAULT 0',
+        'anti_flood': 'INTEGER DEFAULT 1',
+        'anti_forward': 'INTEGER DEFAULT 1',
+        'anti_links': 'INTEGER DEFAULT 1',
+        'captcha': 'INTEGER DEFAULT 0',
+        'max_warnings': 'INTEGER DEFAULT 3',
+    }
+    for col, ddl in required.items():
+        if col not in existing:
+            cursor.execute(f"ALTER TABLE chat_settings ADD COLUMN {col} {ddl}")
+
+
 def init_db():
     cursor.executescript("""
         CREATE TABLE IF NOT EXISTS forbidden_words (
@@ -130,6 +148,7 @@ def init_db():
             added_at TEXT DEFAULT (datetime('now'))
         );
     """)
+    ensure_chat_settings_schema()
     conn.commit()
     for row in cursor.execute("SELECT user_id FROM bot_admins").fetchall():
         ADMIN_IDS.add(row[0])
