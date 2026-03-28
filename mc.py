@@ -1418,63 +1418,97 @@ async def _captcha_timeout(user_id, chat_id, code):
             pass
 
 
+def _is_member_status(status: str) -> bool:
+    return status in ('member', 'administrator', 'creator', 'restricted')
+
+
+async def start_captcha_for_user(chat: types.Chat, user: types.User):
+    chat_id = chat.id
+    if user.is_bot:
+        return
+    if not get_setting(chat_id, 'captcha'):
+        return
+
+    exists = cursor.execute(
+        "SELECT 1 FROM captcha_pending WHERE user_id=? AND chat_id=?",
+        (user.id, chat_id)
+    ).fetchone()
+    if exists:
+        return
+
+    uid = user.id
+    code = _gen_captcha_code()
+    try:
+        await bot.restrict_chat_member(
+            chat_id, uid,
+            permissions=ChatPermissions(can_send_messages=False)
+        )
+    except (BadRequest, Forbidden):
+        pass
+
+    cursor.execute(
+        "INSERT OR REPLACE INTO captcha_pending(user_id,chat_id,code,created_at)"
+        " VALUES(?,?,?,?)",
+        (uid, chat_id, code, int(time.time()))
+    )
+    conn.commit()
+
+    dm_sent = False
+    try:
+        await bot.send_message(
+            uid,
+            f"👋 Привет! Вы вступили в чат <b>{chat.title}</b>.\n\n"
+            f"Введите этот код в группе для верификации:\n\n"
+            f"<code>{code}</code>\n\n"
+            f"⏱ У вас есть <b>{CAPTCHA_TIMEOUT} секунд</b>.\n"
+            f"Если не введёте — вас кикнут автоматически."
+        )
+        dm_sent = True
+    except Exception:
+        pass
+
+    if dm_sent:
+        chat_msg = await bot.send_message(
+            chat_id,
+            f"👋 {mention(user)}, добро пожаловать!\n\n"
+            f"🔐 Проверьте <b>личные сообщения от бота</b> — введите там указанный код здесь.\n"
+            f"⏱ Время: <b>{CAPTCHA_TIMEOUT} сек</b>."
+        )
+    else:
+        chat_msg = await bot.send_message(
+            chat_id,
+            f"👋 {mention(user)}, добро пожаловать!\n\n"
+            f"🔐 Введите код для верификации:\n<code>{code}</code>\n\n"
+            f"⏱ У вас есть <b>{CAPTCHA_TIMEOUT} секунд</b>."
+        )
+
+    asyncio.create_task(_captcha_timeout(uid, chat_id, code))
+    asyncio.create_task(auto_delete(chat_id, chat_msg.message_id, CAPTCHA_TIMEOUT + 5))
+
+
 @dp.message_handler(content_types=types.ContentType.NEW_CHAT_MEMBERS)
 async def on_new_member(message: types.Message):
     chat_id = message.chat.id
     register_chat(chat_id, message.chat.title or str(chat_id))
 
-    if not get_setting(chat_id, 'captcha'):
+    for user in message.new_chat_members:
+        await start_captcha_for_user(message.chat, user)
+
+
+@dp.chat_member_handler()
+async def on_chat_member(update: types.ChatMemberUpdated):
+    chat = update.chat
+    if chat.type not in (types.ChatType.GROUP, types.ChatType.SUPERGROUP):
         return
 
-    for user in message.new_chat_members:
-        if user.is_bot:
-            continue
-        uid  = user.id
-        code = _gen_captcha_code()
-        try:
-            await bot.restrict_chat_member(
-                chat_id, uid,
-                permissions=ChatPermissions(can_send_messages=False)
-            )
-        except (BadRequest, Forbidden):
-            pass
+    register_chat(chat.id, chat.title or str(chat.id))
 
-        cursor.execute(
-            "INSERT OR REPLACE INTO captcha_pending(user_id,chat_id,code,created_at)"
-            " VALUES(?,?,?,?)",
-            (uid, chat_id, code, int(time.time()))
-        )
-        conn.commit()
+    old_status = update.old_chat_member.status
+    new_status = update.new_chat_member.status
+    user = update.new_chat_member.user
 
-        dm_sent = False
-        try:
-            await bot.send_message(
-                uid,
-                f"👋 Привет! Вы вступили в чат <b>{message.chat.title}</b>.\n\n"
-                f"Введите этот код в группе для верификации:\n\n"
-                f"<code>{code}</code>\n\n"
-                f"⏱ У вас есть <b>{CAPTCHA_TIMEOUT} секунд</b>.\n"
-                f"Если не введёте — вас кикнут автоматически."
-            )
-            dm_sent = True
-        except Exception:
-            pass
-
-        if dm_sent:
-            chat_msg = await message.reply(
-                f"👋 {mention(user)}, добро пожаловать!\n\n"
-                f"🔐 Проверьте <b>личные сообщения от бота</b> — введите там указанный код здесь.\n"
-                f"⏱ Время: <b>{CAPTCHA_TIMEOUT} сек</b>."
-            )
-        else:
-            chat_msg = await message.reply(
-                f"👋 {mention(user)}, добро пожаловать!\n\n"
-                f"🔐 Введите код для верификации:\n<code>{code}</code>\n\n"
-                f"⏱ У вас есть <b>{CAPTCHA_TIMEOUT} секунд</b>."
-            )
-
-        asyncio.create_task(_captcha_timeout(uid, chat_id, code))
-        asyncio.create_task(auto_delete(chat_id, chat_msg.message_id, CAPTCHA_TIMEOUT + 5))
+    if (not _is_member_status(old_status)) and _is_member_status(new_status):
+        await start_captcha_for_user(chat, user)
 
 
 # ══════════════════════════════════════════════════════════════
